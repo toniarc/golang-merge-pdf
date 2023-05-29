@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gerar_unico/pdf"
+	"gerar_unico/s3"
 	"io"
 	"io/ioutil"
 	"log"
@@ -18,15 +19,39 @@ import (
 	"github.com/julienschmidt/httprouter"
 )
 
-var protocoloServiceBaseUrl = "http://localhost:8081/pae-protocolo-producer-service"
-var anexoServiceBaseUrl = "http://localhost:8089/pae-anexo-service"
+var protocoloServiceBaseUrl = os.Getenv("PAE_ENV_PROTOCOLO_HOST") + "/pae-protocolo-producer-service"
+var anexoServiceBaseUrl = os.Getenv("PAE_ENV_ANEXO_SERVICE_HOST") + "/pae-anexo-service"
 var context = "/pae-gerar-documento-unico-service"
 var tmp = "/tmp/"
+var minioClient = s3.CreateClient()
 
 func main() {
 	router := httprouter.New()
 	router.POST(context+"/documento-unico/:ano/:numero", GerarDocumentoUnico)
-	http.ListenAndServe(":8093", router)
+	router.GET(context+"/documento-unico/:tempFileId", Download)
+
+	port := os.Getenv("PAE_ENV_GERAR_DOCUMENTO_SERVICE_LOCAL_SERVER_PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	http.ListenAndServe(":"+port, router)
+	fmt.Println("Server running on port " + port)
+}
+
+func Download(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+
+	tempFileId := ps.ByName("tempFileId")
+
+	file, err := s3.Donwload(tempFileId, minioClient)
+	if err != nil {
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Write(file)
 }
 
 func GerarDocumentoUnico(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -76,7 +101,7 @@ func GerarDocumentoUnico(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	files = append(files, capaProcessoFileId)
 
 	for i, id := range anexosIds {
-		fmt.Printf("baixando anexo %d de %d...", i+1, len(anexosIds))
+		fmt.Printf("[Protocolo %d/%d] baixando anexo %d de %d...", ano, numero, i+1, len(anexosIds))
 		watch := stopwatch.Start()
 		files = append(files, buscarAnexoPdf(id, token))
 		watch.Stop()
@@ -92,15 +117,12 @@ func GerarDocumentoUnico(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		os.Remove(file)
 	}
 
-	fileBytes, err := ioutil.ReadFile(resultFile)
-	if err != nil {
-		panic(err)
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Write(fileBytes)
+	tempFileId, _ := uuid.NewRandom()
+	s3.Upload(tempFileId.String(), resultFile, minioClient)
 
 	os.Remove(resultFile)
+
+	w.Write([]byte(tempFileId.String()))
 }
 
 func buscarProtocolo(ano int, numero int, token string) Protocolo {
